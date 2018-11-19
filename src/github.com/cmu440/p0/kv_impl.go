@@ -16,7 +16,7 @@ func put(key string, value []byte) {
 }
 
 // get fetches the value associated with the key
-func get(key string) []([]byte) {
+func get(key string) [][]byte {
 	v, _ := kvstore[key]
 	return v
 }

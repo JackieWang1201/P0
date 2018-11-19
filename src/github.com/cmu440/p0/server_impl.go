@@ -5,31 +5,32 @@ package p0
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"net"
 	"strings"
 )
 
 type keyValueServer struct {
-	clients  map[net.Conn]bool
-	msg      chan CMD
-	stop     chan interface{}
-	deadConn chan net.Conn
-	newConn  chan net.Conn
-	count    chan chan int
-	active   int
-	dropped  int
+	clients      map[net.Conn]bool
+	msg          chan CMD
+	stop         chan interface{}
+	deadConn     chan net.Conn
+	newConn      chan net.Conn
+	countActive  chan chan int
+	countDropped chan chan int
+	active       int
+	dropped      int
 }
 
 // New creates and returns (but does not start) a new KeyValueServer.
 func New() KeyValueServer {
 	return &keyValueServer{
-		clients:  make(map[net.Conn]bool),
-		msg:      make(chan CMD),
-		newConn:  make(chan net.Conn),
-		deadConn: make(chan net.Conn),
-		stop:     make(chan interface{}),
-		count:    make(chan chan int),
+		clients:      make(map[net.Conn]bool),
+		msg:          make(chan CMD),
+		newConn:      make(chan net.Conn),
+		deadConn:     make(chan net.Conn),
+		stop:         make(chan interface{}),
+		countActive:  make(chan chan int),
+		countDropped: make(chan chan int),
 	}
 }
 
@@ -38,9 +39,9 @@ func (kvs *keyValueServer) Start(port int) error {
 	case <-kvs.stop:
 		return fmt.Errorf("Cannot start server after its been started")
 	default:
+		init_db()
 		break
 	}
-	init_db()
 
 	listener, err := net.Listen("tcp4", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -52,25 +53,17 @@ func (kvs *keyValueServer) Start(port int) error {
 	go func(l net.Listener) {
 	accept:
 		for {
-			fmt.Println("Starting accept loop", l.Addr())
 			select {
 			case <-kvs.stop:
 				fmt.Println("stopped")
 				break accept
 			default:
-				fmt.Println("continue")
 				break
 			}
-			fmt.Println("accepting")
 			conn, err := l.Accept()
-
 			if err != nil {
-				fmt.Println("err")
-				conn.Close()
-				fmt.Println(err)
-				continue
+				break accept
 			}
-			fmt.Println("accepting")
 			client := NewClient(conn, kvs)
 			go client.Start()
 			kvs.newConn <- conn
@@ -81,15 +74,18 @@ func (kvs *keyValueServer) Start(port int) error {
 	logic:
 		for {
 			select {
-			case c := <-kvs.count:
-				c <- len(kvs.clients)
+			case c := <-kvs.countActive:
+				c <- kvs.active
+			case c := <-kvs.countDropped:
+				c <- kvs.dropped
 			case conn := <-kvs.newConn:
-				fmt.Println("New conn", conn)
 				kvs.clients[conn] = true
+				kvs.active++
 			case <-kvs.stop:
 				listener.Close()
 				for client, _ := range kvs.clients {
 					client.Close()
+					delete(kvs.clients, client)
 					kvs.dropped++
 				}
 				kvs.active = 0
@@ -97,6 +93,7 @@ func (kvs *keyValueServer) Start(port int) error {
 			case conn := <-kvs.deadConn:
 				conn.Close()
 				delete(kvs.clients, conn)
+				kvs.active--
 				kvs.dropped++
 			case cmd := <-kvs.msg:
 				cmd.Run()
@@ -108,34 +105,35 @@ func (kvs *keyValueServer) Start(port int) error {
 }
 
 func (kvs *keyValueServer) Close() {
-	// close (this returns the zero value everywhere immediately)
 	close(kvs.stop)
 }
 
 func (kvs *keyValueServer) CountActive() int {
 	c := make(chan int)
-	kvs.count <- c
+	kvs.countActive <- c
 	return <-c
-
 }
 
 func (kvs *keyValueServer) CountDropped() int {
-	return kvs.dropped
+	c := make(chan int)
+	kvs.countDropped <- c
+	return <-c
 }
 
 type client struct {
 	stop     chan interface{}
 	deadConn chan net.Conn
+	dead     chan interface{}
 	write    chan fetchRes
 	msgs     chan CMD
 	conn     net.Conn
 }
 
 func NewClient(conn net.Conn, serv *keyValueServer) client {
-	fmt.Println("new client", conn)
 	return client{
 		stop:     serv.stop,
 		msgs:     serv.msg,
+		dead:     make(chan interface{}),
 		deadConn: serv.deadConn,
 		write:    make(chan fetchRes, 500),
 		conn:     conn,
@@ -143,24 +141,29 @@ func NewClient(conn net.Conn, serv *keyValueServer) client {
 }
 
 func (cl client) Start() {
-	fmt.Println("Starting client", cl.conn.RemoteAddr())
 	go func() {
 		for {
-			msg, err := bufio.NewReader(cl.conn).ReadString('\n')
-			if err != nil {
-				fmt.Printf("err in client : %s", err)
-				if err == io.EOF {
-					cl.deadConn <- cl.conn
-					break
+			select {
+			case <-cl.dead:
+				return
+			default:
+				break
+			}
+			scanner := bufio.NewScanner(cl.conn)
+			for {
+				scanned := scanner.Scan()
+				if !scanned {
+					close(cl.dead)
+					return
 				}
-				continue
+
+				cmd, err := cl.parseMsg(scanner.Text())
+				if err != nil {
+					fmt.Printf("err parsing : %s\n", err)
+					continue
+				}
+				cl.msgs <- cmd
 			}
-			cmd, err := cl.parseMsg(msg)
-			if err != nil {
-				fmt.Printf("err in client : %s", err)
-				continue
-			}
-			cl.msgs <- cmd
 		}
 	}()
 
@@ -168,14 +171,19 @@ loop:
 	for {
 		select {
 		case msg := <-cl.write:
+		vals:
 			for _, v := range msg.vals {
 				n, err := fmt.Fprintf(cl.conn, "%s,%s\n", msg.k, v)
 				if n == 0 || err != nil {
-					fmt.Printf("err in client : %s", err)
-					cl.deadConn <- cl.conn
-					break loop
+					fmt.Printf("err writing : %s\n", err)
+					close(cl.dead)
+					break vals
 				}
 			}
+		case <-cl.dead:
+			cl.conn.Close()
+			cl.deadConn <- cl.conn
+			break loop
 		case <-cl.stop:
 			break loop
 		}
@@ -222,7 +230,7 @@ type fetchRes struct {
 
 func (f fetch) Run() {
 	select {
-	case f.reply <- fetchRes{f.k, get(f.k)}:
+	case f.reply <- fetchRes{k: f.k, vals: get(f.k)}:
 	default:
 		return
 	}
@@ -234,6 +242,7 @@ type set struct {
 }
 
 func (s set) Run() {
+	// fmt.Println("set", s)
 	put(s.k, s.v)
 }
 
